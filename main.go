@@ -1,325 +1,118 @@
 package main
 
 import (
-	"context"
-	"flag"
 	"fmt"
 	"math/rand"
-	"net"
-	"net/http"
 	"os"
-	"os/exec"
-	"os/signal"
-	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pkg/browser"
+	"github.com/spf13/pflag"
+
+	"go.coder.com/cli"
 	"go.coder.com/flog"
-	"golang.org/x/xerrors"
 )
 
 func init() {
 	rand.Seed(time.Now().Unix())
 }
 
+const helpTabWidth = 5
+
+var (
+	helpTab = strings.Repeat(" ", helpTabWidth)
+	// version is overwritten by ci/build.sh.
+	version string
+)
+
 func main() {
-	var (
-		skipSyncFlag = flag.Bool("skipsync", false, "skip syncing local settings and extensions to remote host")
-		sshFlags     = flag.String("ssh-flags", "", "custom SSH flags")
-		syncBack     = flag.Bool("b", false, "sync extensions back on termination")
-	)
+	cli.RunRoot(&rootCmd{})
+}
 
-	flag.Usage = func() {
-		fmt.Printf(`Usage: [-skipsync] %v HOST [DIR] [SSH ARGS...]
+var _ interface {
+	cli.Command
+	cli.FlaggedCommand
+} = new(rootCmd)
 
-Start code-server over SSH.
-More info: https://github.com/codercom/sshcode
-`, os.Args[0],
-		)
+type rootCmd struct {
+	skipSync          bool
+	syncBack          bool
+	printVersion      bool
+	noReuseConnection bool
+	bindAddr          string
+	sshFlags          string
+	uploadCodeServer  string
+}
+
+func (c *rootCmd) Spec() cli.CommandSpec {
+	return cli.CommandSpec{
+		Name:  "sshcode",
+		Usage: c.usage(),
+		Desc:  c.description(),
+	}
+}
+
+func (c *rootCmd) RegisterFlags(fl *pflag.FlagSet) {
+	fl.BoolVar(&c.skipSync, "skipsync", false, "skip syncing local settings and extensions to remote host")
+	fl.BoolVar(&c.syncBack, "b", false, "sync extensions back on termination")
+	fl.BoolVar(&c.printVersion, "version", false, "print version information and exit")
+	fl.BoolVar(&c.noReuseConnection, "no-reuse-connection", false, "do not reuse SSH connection via control socket")
+	fl.StringVar(&c.bindAddr, "bind", "", "local bind address for SSH tunnel, in [HOST][:PORT] syntax (default: 127.0.0.1)")
+	fl.StringVar(&c.sshFlags, "ssh-flags", "", "custom SSH flags")
+	fl.StringVar(&c.uploadCodeServer, "upload-code-server", "", "custom code-server binary to upload to the remote host")
+}
+
+func (c *rootCmd) Run(fl *pflag.FlagSet) {
+	if c.printVersion {
+		fmt.Printf("%v\n", version)
+		os.Exit(0)
 	}
 
-	flag.Parse()
-	host := flag.Arg(0)
-
+	host := fl.Arg(0)
 	if host == "" {
 		// If no host is specified output the usage.
-		flag.Usage()
+		fl.Usage()
 		os.Exit(1)
 	}
 
-	dir := flag.Arg(1)
+	dir := fl.Arg(1)
 	if dir == "" {
 		dir = "~"
 	}
 
-	flog.Info("ensuring code-server is updated...")
+	err := sshCode(host, dir, options{
+		skipSync:         c.skipSync,
+		sshFlags:         c.sshFlags,
+		bindAddr:         c.bindAddr,
+		syncBack:         c.syncBack,
+		reuseConnection:  !c.noReuseConnection,
+		uploadCodeServer: c.uploadCodeServer,
+	})
 
-	const codeServerPath = "/tmp/codessh-code-server"
+	if err != nil {
+		flog.Fatal("error: %v", err)
+	}
+}
 
-	downloadScript := `set -euxo pipefail || exit 1
+func (c *rootCmd) usage() string {
+	return "[FLAGS] HOST [DIR]"
+}
 
-mkdir -p ~/.local/share/code-server
-cd ` + filepath.Dir(codeServerPath) + `
-wget -N https://codesrv-ci.cdr.sh/latest-linux
-[ -f ` + codeServerPath + ` ] && rm ` + codeServerPath + `
-ln latest-linux ` + codeServerPath + `
-chmod +x ` + codeServerPath
-	// Downloads the latest code-server and allows it to be executed.
-	sshCmdStr := fmt.Sprintf("ssh" +
-		" " + *sshFlags + " " +
-		host + " /bin/bash",
+func (c *rootCmd) description() string {
+	return fmt.Sprintf(`Start VS Code via code-server over SSH.
+
+Environment variables:
+%v%v use special VS Code settings dir.
+%v%v use special VS Code extensions dir.
+
+More info: https://github.com/cdr/sshcode
+
+Arguments:
+%vHOST is passed into the ssh command. Valid formats are '<ip-address>' or 'gcp:<instance-name>'.
+%vDIR is optional.`,
+		helpTab, vsCodeConfigDirEnv,
+		helpTab, vsCodeExtensionsDirEnv,
+		helpTab,
+		helpTab,
 	)
-	sshCmd := exec.Command("sh", "-c", sshCmdStr)
-	sshCmd.Stdout = os.Stdout
-	sshCmd.Stderr = os.Stderr
-	sshCmd.Stdin = strings.NewReader(downloadScript)
-	err := sshCmd.Run()
-	if err != nil {
-		flog.Fatal("failed to update code-server: %v\n---ssh cmd---\n%s\n---download script---\n%s", err,
-			sshCmdStr,
-			downloadScript,
-		)
-	}
-
-	if !*skipSyncFlag {
-		start := time.Now()
-		flog.Info("syncing settings")
-		err = syncUserSettings(*sshFlags, host, false)
-		if err != nil {
-			flog.Fatal("failed to sync settings: %v", err)
-		}
-		flog.Info("synced settings in %s", time.Since(start))
-
-		flog.Info("syncing extensions")
-		err = syncExtensions(*sshFlags, host, false)
-		if err != nil {
-			flog.Fatal("failed to sync extensions: %v", err)
-		}
-		flog.Info("synced extensions in %s", time.Since(start))
-	}
-
-	flog.Info("starting code-server...")
-	localPort, err := randomPort()
-	if err != nil {
-		flog.Fatal("failed to find available port: %v", err)
-	}
-
-	sshCmdStr = fmt.Sprintf("ssh -tt -q -L %v %v %v 'cd %v; %v --host 127.0.0.1 --allow-http --no-auth --port=%v'",
-		localPort+":localhost:"+localPort, *sshFlags, host, dir, codeServerPath, localPort,
-	)
-
-	// Starts code-server and forwards the remote port.
-	sshCmd = exec.Command("sh", "-c",
-		sshCmdStr,
-	)
-	sshCmd.Stdin = os.Stdin
-	sshCmd.Stdout = os.Stdout
-	sshCmd.Stderr = os.Stderr
-	err = sshCmd.Start()
-	if err != nil {
-		flog.Fatal("failed to start code-server: %v", err)
-	}
-
-	url := "http://127.0.0.1:" + localPort
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	for {
-		if ctx.Err() != nil {
-			flog.Fatal("code-server didn't start in time %v", ctx.Err())
-		}
-		// Waits for code-server to be available before opening the browser.
-		r, _ := http.NewRequest("GET", url, nil)
-		r = r.WithContext(ctx)
-		resp, err := http.DefaultClient.Do(r)
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-		break
-	}
-
-	ctx, cancel = context.WithCancel(context.Background())
-	openBrowser(url)
-
-	go func() {
-		defer cancel()
-		sshCmd.Wait()
-	}()
-
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt)
-
-	select {
-	case <-ctx.Done():
-	case <-c:
-	}
-
-	if !*syncBack {
-		flog.Info("shutting down")
-		return
-	}
-
-	flog.Info("synchronizing VS Code back to local")
-
-	err = syncExtensions(*sshFlags, host, true)
-	if err != nil {
-		flog.Fatal("failed to sync extensions back: %v", err)
-	}
-
-	err = syncUserSettings(*sshFlags, host, true)
-	if err != nil {
-		flog.Fatal("failed to user settigns extensions back: %v", err)
-	}
-}
-
-func openBrowser(url string) {
-	var openCmd *exec.Cmd
-	switch {
-	case commandExists("google-chrome"):
-		openCmd = exec.Command("google-chrome", chromeOptions(url)...)
-	case commandExists("chromium"):
-		openCmd = exec.Command("chromium", chromeOptions(url)...)
-	case commandExists("chromium-browser"):
-		openCmd = exec.Command("chromium-browser", chromeOptions(url)...)
-	case pathExists("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
-		openCmd = exec.Command("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", chromeOptions(url)...)
-	default:
-		err := browser.OpenURL(url)
-		if err != nil {
-			flog.Error("failed to open browser: %v", err)
-		}
-		return
-	}
-
-	// We do not use CombinedOutput because if there is no chrome instance, this will block
-	// and become the parent process instead of using an existing chrome instance.
-	err := openCmd.Start()
-	if err != nil {
-		flog.Error("failed to open browser: %v", err)
-	}
-}
-
-func chromeOptions(url string) []string {
-	return []string{"--app=" + url, "--disable-extensions", "--disable-plugins", "--incognito"}
-}
-
-// Checks if a command exists locally.
-func commandExists(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
-}
-
-func pathExists(name string) bool {
-	_, err := os.Stat(name)
-	return err == nil
-}
-
-// randomPort picks a random port to start code-server on.
-func randomPort() (string, error) {
-	const (
-		minPort  = 1024
-		maxPort  = 65535
-		maxTries = 10
-	)
-	for i := 0; i < maxTries; i++ {
-		port := rand.Intn(maxPort-minPort+1) + minPort
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-		if err == nil {
-			_ = l.Close()
-			return strconv.Itoa(port), nil
-		}
-		flog.Info("port taken: %d", port)
-	}
-
-	return "", xerrors.Errorf("max number of tries exceeded: %d", maxTries)
-}
-
-func syncUserSettings(sshFlags string, host string, back bool) error {
-	localConfDir, err := configDir()
-	if err != nil {
-		return err
-	}
-	const remoteSettingsDir = ".local/share/code-server/User/"
-
-	var (
-		src  = localConfDir + "/"
-		dest = host + ":" + remoteSettingsDir
-	)
-
-	if back {
-		dest, src = src, dest
-	}
-
-	// Append "/" to have rsync copy the contents of the dir.
-	return rsync(src, dest, sshFlags, "workspaceStorage", "logs", "CachedData")
-}
-
-func syncExtensions(sshFlags string, host string, back bool) error {
-	localExtensionsDir, err := extensionsDir()
-	if err != nil {
-		return err
-	}
-	const remoteExtensionsDir = ".local/share/code-server/extensions/"
-
-	var (
-		src  = localExtensionsDir + "/"
-		dest = host + ":" + remoteExtensionsDir
-	)
-	if back {
-		dest, src = src, dest
-	}
-
-	return rsync(src, dest, sshFlags)
-}
-
-func rsync(src string, dest string, sshFlags string, excludePaths ...string) error {
-	excludeFlags := make([]string, len(excludePaths))
-	for i, path := range excludePaths {
-		excludeFlags[i] = "--exclude=" + path
-	}
-
-	cmd := exec.Command("rsync", append(excludeFlags, "-azvr",
-		"-e", "ssh "+sshFlags,
-		// Only update newer directories, and sync times
-		// to keep things simple.
-		"-u", "--times",
-		"--copy-unsafe-links",
-		src, dest,
-	)...,
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		return xerrors.Errorf("failed to rsync '%s' to '%s': %w", src, dest, err)
-	}
-
-	return nil
-}
-
-func configDir() (string, error) {
-	var path string
-	switch runtime.GOOS {
-	case "linux":
-		path = os.ExpandEnv("$HOME/.config/Code/User/")
-	case "darwin":
-		path = os.ExpandEnv("$HOME/Library/Application Support/Code/User/")
-	default:
-		return "", xerrors.Errorf("unsupported platform: %s", runtime.GOOS)
-	}
-	return filepath.Clean(path), nil
-}
-
-func extensionsDir() (string, error) {
-	var path string
-	switch runtime.GOOS {
-	case "linux", "darwin":
-		path = os.ExpandEnv("$HOME/.vscode/extensions/")
-	default:
-		return "", xerrors.Errorf("unsupported platform: %s", runtime.GOOS)
-	}
-	return filepath.Clean(path), nil
 }

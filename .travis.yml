@@ -1,0 +1,11 @@
+dist: xenial
+language: go
+go:
+- 1.12.x
+go_import_path: go.coder.com/retry
+env:
+  - GO111MODULE=on
+script: 
+- ./ci/ensuremod.sh
+- ./ci/lint.sh 
+- go test -v ./...
